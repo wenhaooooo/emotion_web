@@ -116,6 +116,15 @@ async def job_video_segment(job_id: str, segment_index: int):
     return FileResponse(matches[0], media_type="video/mp4")
 
 
+def _format_time(seconds: float) -> str:
+    """将秒数格式化为 HH:MM:SS 格式"""
+    total_seconds = int(seconds)
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
 @router.get("/jobs/{job_id}/export")
 async def job_export_excel(job_id: str):
     import openpyxl
@@ -135,7 +144,7 @@ async def job_export_excel(job_id: str):
     ws.title = "情感识别结果"
 
     # Header
-    headers = ["#", "开始时间", "结束时间", "时长(秒)", "文本",
+    headers = ["#", "开始时间", "结束时间", "时长", "文本",
                "emotion2vec标签", "emotion2vec标签名", "教师标签", "教师标签名", "置信度"]
     header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
     header_font = Font(color="FFFFFF", bold=True, size=11)
@@ -155,9 +164,9 @@ async def job_export_excel(job_id: str):
     for seg in result.segments:
         row = [
             seg.index + 1,
-            round(seg.start_time, 2),
-            round(seg.end_time, 2),
-            round(seg.duration, 2),
+            _format_time(seg.start_time),
+            _format_time(seg.end_time),
+            _format_time(seg.duration),
             seg.text,
             seg.emotion2vec_label,
             seg.emotion2vec_label_name,
@@ -170,7 +179,7 @@ async def job_export_excel(job_id: str):
             cell.border = thin_border
 
     # Column widths
-    widths = [5, 10, 10, 8, 40, 12, 14, 8, 12, 8]
+    widths = [5, 10, 10, 10, 40, 12, 14, 8, 12, 8]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 
