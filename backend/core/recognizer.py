@@ -41,13 +41,27 @@ def _get_predictor(model_id: str = "iic/emotion2vec_plus_large", hub: str = "ms"
 
 class Emotion2VecPredictor:
     def __init__(self, model_id="iic/emotion2vec_plus_large", hub="ms", model_path=None):
-        from funasr import AutoModel
-        if model_path and os.path.isdir(model_path):
-            logger.info(f"Loading local emotion2vec model: {model_path}")
-            self.model = AutoModel(model=model_path)
-        else:
-            logger.info(f"Loading emotion2vec model: {model_id}")
-            self.model = AutoModel(model=model_id, hub=hub)
+        import sys
+        import warnings
+
+        logger.info(f"Loading emotion2vec model: {model_id}")
+
+        # 静默加载：funasr/modelscope/jieba 会输出大量无关日志和警告
+        _devnull = open(os.devnull, "w")
+        _old_stdout, _old_stderr = sys.stdout, sys.stderr
+        sys.stdout = sys.stderr = _devnull
+        warnings.filterwarnings("ignore")
+        try:
+            from funasr import AutoModel
+            if model_path and os.path.isdir(model_path):
+                self.model = AutoModel(model=model_path, disable_update=True, trust_remote_code=True)
+            else:
+                self.model = AutoModel(model=model_id, hub=hub, disable_update=True, trust_remote_code=True)
+        finally:
+            sys.stdout, sys.stderr = _old_stdout, _old_stderr
+            _devnull.close()
+            warnings.resetwarnings()
+
         logger.info("emotion2vec model loaded")
 
     def predict(self, wav_path: str) -> dict:

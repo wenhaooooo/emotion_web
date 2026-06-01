@@ -1,14 +1,23 @@
 import asyncio
+import base64
 import io
 import json
 import logging
+import tempfile
 import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Request
+import cv2
+import numpy as np
+import soundfile as sf
+from fastapi import APIRouter, UploadFile, File, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, FileResponse
 
 from api.schemas import JobStatus, JobResult
+from core.face_recognizer import get_face_recognizer
 from tasks.manager import JobManager, run_processing_job
 
 logger = logging.getLogger(__name__)
@@ -20,6 +29,15 @@ UPLOADS_DIR = BASE_DIR / "storage" / "uploads"
 JOBS_DIR = BASE_DIR / "storage" / "jobs"
 
 job_manager = JobManager(JOBS_DIR)
+
+# 线程池用于模型推理
+thread_pool = ThreadPoolExecutor(max_workers=4)
+
+# 实时识别音频配置
+AUDIO_WINDOW_SECONDS = 3      # 音频窗口时长
+AUDIO_SLIDE_SECONDS = 1.5     # 滑动步长
+AUDIO_SAMPLE_RATE = 16000     # 采样率
+SILENCE_RMS_THRESHOLD = 0.03  # 静音检测阈值（RMS 能量），低于此值视为安静
 
 ALLOWED_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv"}
 
@@ -197,3 +215,215 @@ async def job_export_excel(job_id: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ==================== 实时情感识别 WebSocket ====================
+
+
+def _process_video_frame(base64_data: str) -> dict:
+    """处理视频帧：base64 解码 → 人脸检测 → 表情识别"""
+    face_recognizer = get_face_recognizer()
+    if not face_recognizer.is_loaded:
+        return {"type": "face_emotion", "face_detected": False}
+
+    try:
+        # base64 解码为图像
+        img_bytes = base64.b64decode(base64_data)
+        nparr = np.frombuffer(img_bytes, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        if frame is None:
+            return {"type": "face_emotion", "face_detected": False}
+
+        # 推理
+        result = face_recognizer.predict(frame)
+        result["type"] = "face_emotion"
+        return result
+    except Exception as e:
+        logger.error(f"视频帧处理失败: {e}")
+        return {"type": "face_emotion", "face_detected": False}
+
+
+def _process_audio_buffer(audio_buffer: np.ndarray) -> dict:
+    """处理音频缓冲：PCM → WAV → emotion2vec 推理"""
+    from core.recognizer import _get_predictor
+    from core.face_recognizer import map_emotion2vec_to_7class
+
+    try:
+        # 静音检测：计算 RMS 能量
+        rms = float(np.sqrt(np.mean(audio_buffer ** 2)))
+        if rms < SILENCE_RMS_THRESHOLD:
+            return {"type": "voice_emotion", "silence": True}
+
+        # 保存为临时 WAV 文件
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp_path = tmp.name
+            sf.write(tmp_path, audio_buffer, AUDIO_SAMPLE_RATE)
+
+        # emotion2vec 推理
+        predictor = _get_predictor()
+        raw_result = predictor.predict(tmp_path)
+
+        # 清理临时文件
+        import os
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+        # 映射到 7 类
+        result = map_emotion2vec_to_7class(raw_result)
+        result["type"] = "voice_emotion"
+        return result
+    except Exception as e:
+        logger.error(f"音频处理失败: {e}")
+        return {"type": "voice_emotion", "silence": True}
+
+
+@router.websocket("/ws/realtime")
+async def websocket_realtime(websocket: WebSocket):
+    """实时情感识别 WebSocket 端点"""
+    await websocket.accept()
+
+    # 创建实时识别 Job
+    job_id = uuid.uuid4().hex[:12]
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+
+    await websocket.send_json({"type": "connected", "job_id": job_id})
+    logger.info(f"实时识别 WebSocket 已连接, job_id={job_id}")
+
+    # 音频缓冲区
+    audio_buffer = np.array([], dtype=np.float32)
+
+    # 结果累积
+    results = []
+    start_time = time.time()
+
+    # 跟踪并发任务
+    pending_tasks = set()
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            message = json.loads(raw)
+            msg_type = message.get("type")
+
+            if msg_type == "video_frame":
+                # 在线程池中处理视频帧
+                loop = asyncio.get_event_loop()
+                task = loop.run_in_executor(
+                    thread_pool,
+                    _process_video_frame,
+                    message["data"],
+                )
+                pending_tasks.add(task)
+                task.add_done_callback(pending_tasks.discard)
+
+                # 异步等待结果并推送
+                async def send_face_result(t):
+                    try:
+                        result = await t
+                        results.append({
+                            "timestamp": time.time() - start_time,
+                            "source": "face",
+                            **result,
+                        })
+                        await websocket.send_json(result)
+                    except Exception as e:
+                        logger.error(f"发送面部结果失败: {e}")
+
+                asyncio.create_task(send_face_result(task))
+
+            elif msg_type == "audio_chunk":
+                # base64 解码音频数据（PCM float32）
+                try:
+                    audio_bytes = base64.b64decode(message["data"])
+                    pcm_data = np.frombuffer(audio_bytes, dtype=np.float32)
+                    audio_buffer = np.concatenate([audio_buffer, pcm_data])
+                except Exception as e:
+                    logger.error(f"音频解码失败: {e}")
+                    continue
+
+                # 当缓冲区达到窗口大小时触发推理
+                window_samples = AUDIO_WINDOW_SECONDS * AUDIO_SAMPLE_RATE
+                if len(audio_buffer) >= window_samples:
+                    # 取出一个窗口
+                    window = audio_buffer[:window_samples].copy()
+
+                    # 滑动窗口：保留后半部分
+                    slide_samples = int(AUDIO_SLIDE_SECONDS * AUDIO_SAMPLE_RATE)
+                    audio_buffer = audio_buffer[slide_samples:]
+
+                    # 在线程池中处理音频
+                    loop = asyncio.get_event_loop()
+                    task = loop.run_in_executor(
+                        thread_pool,
+                        _process_audio_buffer,
+                        window,
+                    )
+                    pending_tasks.add(task)
+                    task.add_done_callback(pending_tasks.discard)
+
+                    async def send_voice_result(t):
+                        try:
+                            result = await t
+                            results.append({
+                                "timestamp": time.time() - start_time,
+                                "source": "voice",
+                                **result,
+                            })
+                            await websocket.send_json(result)
+                        except Exception as e:
+                            logger.error(f"发送语音结果失败: {e}")
+
+                    asyncio.create_task(send_voice_result(task))
+
+    except WebSocketDisconnect:
+        logger.info(f"实时识别 WebSocket 断开, job_id={job_id}")
+    except Exception as e:
+        logger.error(f"WebSocket 错误: {e}")
+    finally:
+        # 等待所有待处理任务完成
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+        # 保存结果
+        duration = time.time() - start_time
+        realtime_result = {
+            "job_id": job_id,
+            "mode": "realtime",
+            "duration_seconds": round(duration, 2),
+            "start_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_time)),
+            "end_time": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "timeline": [
+                {
+                    "timestamp": r.get("timestamp", 0),
+                    "source": r.get("source", "face"),
+                    "emotion": r.get("emotion", "neutral"),
+                    "confidence": r.get("confidence", 0),
+                    "probabilities": r.get("probabilities", {}),
+                }
+                for r in results
+            ],
+            "summary": _compute_summary(results),
+        }
+
+        result_path = job_dir / "result.json"
+        result_path.write_text(json.dumps(realtime_result, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.info(f"实时识别结果已保存: {result_path}")
+
+
+def _compute_summary(results: list) -> dict:
+    """计算情感分布统计"""
+    emotions = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+    summary = {
+        "face": {e: 0 for e in emotions},
+        "voice": {e: 0 for e in emotions},
+    }
+    for r in results:
+        source = r.get("source", "face")
+        emotion = r.get("emotion", "neutral")
+        if source in summary and emotion in summary[source]:
+            summary[source][emotion] += 1
+    return summary

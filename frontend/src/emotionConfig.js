@@ -65,3 +65,31 @@ export function getLabel(seg, mode) {
 export function getLabelName(seg, mode) {
   return mode === 'teacher' ? seg.label_name_cn : (E2V_NAMES_CN[seg.emotion2vec_label] || seg.emotion2vec_label_name)
 }
+
+// ==================== 实时识别 7 类情感配置 ====================
+
+export const REALTIME_EMOTIONS = [
+  { key: 'angry',    name: '愤怒', icon: '😠', color: '#FF3B30' },
+  { key: 'disgust',  name: '厌恶', icon: '🤢', color: '#8B4513' },
+  { key: 'fear',     name: '恐惧', icon: '😨', color: '#AF52DE' },
+  { key: 'happy',    name: '快乐', icon: '😊', color: '#34C759' },
+  { key: 'neutral',  name: '中性', icon: '😐', color: '#8E8E93' },
+  { key: 'sad',      name: '悲伤', icon: '😢', color: '#007AFF' },
+  { key: 'surprise', name: '惊讶', icon: '😲', color: '#FFCC00' },
+]
+
+export function getEmotionByKey(key) {
+  return REALTIME_EMOTIONS.find(e => e.key === key) || REALTIME_EMOTIONS[4] // default neutral
+}
+
+export function getEmotionColor(key) {
+  return getEmotionByKey(key).color
+}
+
+export function getEmotionName(key) {
+  return getEmotionByKey(key).name
+}
+
+export function getEmotionIcon(key) {
+  return getEmotionByKey(key).icon
+}
