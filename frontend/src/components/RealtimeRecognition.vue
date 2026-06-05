@@ -18,71 +18,87 @@
         </div>
       </div>
 
-      <!-- 右侧：识别结果 -->
+      <!-- 右侧：识别结果（两列） -->
       <div class="result-panel">
-        <!-- 当前情感大字 -->
-        <div class="current-emotion" :style="{ borderColor: currentEmotionColor }">
-          <!-- 面部：未检测到人脸 -->
-          <template v-if="displaySource === 'face' && isRunning && !faceResult.faceDetected">
-            <span class="emotion-icon">👤</span>
-            <div class="emotion-info">
-              <span class="emotion-label status-hint">未检测到人脸</span>
-              <span class="emotion-confidence">请面向摄像头</span>
+        <!-- 面部表情 -->
+        <div class="source-section">
+          <div class="source-header">😊 面部表情</div>
+          <div class="current-emotion" :style="{ borderColor: getEmotionColor(faceResult.emotion) }">
+            <template v-if="isRunning && !faceResult.faceDetected">
+              <span class="emotion-icon">👤</span>
+              <div class="emotion-info">
+                <span class="emotion-label status-hint">未检测到人脸</span>
+                <span class="emotion-confidence">请面向摄像头</span>
+              </div>
+            </template>
+            <template v-else>
+              <span class="emotion-icon">{{ getEmotionIcon(faceResult.emotion) }}</span>
+              <div class="emotion-info">
+                <span class="emotion-label">{{ getEmotionName(faceResult.emotion) }}</span>
+                <span class="emotion-confidence">{{ (faceResult.confidence * 100).toFixed(1) }}%</span>
+              </div>
+            </template>
+          </div>
+          <div class="probability-bars">
+            <div
+              v-for="emotion in REALTIME_EMOTIONS"
+              :key="'face-' + emotion.key"
+              class="bar-row"
+            >
+              <span class="bar-icon">{{ emotion.icon }}</span>
+              <span class="bar-label">{{ emotion.name }}</span>
+              <div class="bar-track">
+                <div
+                  class="bar-fill"
+                  :style="{
+                    width: ((faceResult.probabilities?.[emotion.key] || 0) * 100) + '%',
+                    backgroundColor: emotion.color
+                  }"
+                ></div>
+              </div>
+              <span class="bar-value">{{ ((faceResult.probabilities?.[emotion.key] || 0) * 100).toFixed(1) }}%</span>
             </div>
-          </template>
-          <!-- 语音：安静状态 -->
-          <template v-else-if="displaySource === 'voice' && isRunning && voiceResult.isSilence">
-            <span class="emotion-icon">🔇</span>
-            <div class="emotion-info">
-              <span class="emotion-label status-hint">安静中</span>
-              <span class="emotion-confidence">等待语音输入</span>
-            </div>
-          </template>
-          <!-- 正常显示识别结果 -->
-          <template v-else>
-            <span class="emotion-icon">{{ currentEmotionIcon }}</span>
-            <div class="emotion-info">
-              <span class="emotion-label">{{ currentEmotionName }}</span>
-              <span class="emotion-confidence">{{ currentConfidence }}%</span>
-            </div>
-          </template>
+          </div>
         </div>
 
-        <!-- 数据源切换 -->
-        <div class="source-tabs">
-          <button
-            :class="['source-tab', { active: displaySource === 'face' }]"
-            @click="displaySource = 'face'"
-          >
-            😊 面部表情
-          </button>
-          <button
-            :class="['source-tab', { active: displaySource === 'voice' }]"
-            @click="displaySource = 'voice'"
-          >
-            🎤 语音情感
-          </button>
-        </div>
-
-        <!-- 7类概率柱状图 -->
-        <div class="probability-bars">
-          <div
-            v-for="emotion in REALTIME_EMOTIONS"
-            :key="emotion.key"
-            class="bar-row"
-          >
-            <span class="bar-icon">{{ emotion.icon }}</span>
-            <span class="bar-label">{{ emotion.name }}</span>
-            <div class="bar-track">
-              <div
-                class="bar-fill"
-                :style="{
-                  width: (getCurrentProb(emotion.key) * 100) + '%',
-                  backgroundColor: emotion.color
-                }"
-              ></div>
+        <!-- 语音情感 -->
+        <div class="source-section">
+          <div class="source-header">🎤 语音情感</div>
+          <div class="current-emotion" :style="{ borderColor: getEmotionColor(voiceResult.emotion) }">
+            <template v-if="isRunning && voiceResult.isSilence">
+              <span class="emotion-icon">🔇</span>
+              <div class="emotion-info">
+                <span class="emotion-label status-hint">安静中</span>
+                <span class="emotion-confidence">等待语音输入</span>
+              </div>
+            </template>
+            <template v-else>
+              <span class="emotion-icon">{{ getEmotionIcon(voiceResult.emotion) }}</span>
+              <div class="emotion-info">
+                <span class="emotion-label">{{ getEmotionName(voiceResult.emotion) }}</span>
+                <span class="emotion-confidence">{{ (voiceResult.confidence * 100).toFixed(1) }}%</span>
+              </div>
+            </template>
+          </div>
+          <div class="probability-bars">
+            <div
+              v-for="emotion in REALTIME_EMOTIONS"
+              :key="'voice-' + emotion.key"
+              class="bar-row"
+            >
+              <span class="bar-icon">{{ emotion.icon }}</span>
+              <span class="bar-label">{{ emotion.name }}</span>
+              <div class="bar-track">
+                <div
+                  class="bar-fill"
+                  :style="{
+                    width: ((voiceResult.probabilities?.[emotion.key] || 0) * 100) + '%',
+                    backgroundColor: emotion.color
+                  }"
+                ></div>
+              </div>
+              <span class="bar-value">{{ ((voiceResult.probabilities?.[emotion.key] || 0) * 100).toFixed(1) }}%</span>
             </div>
-            <span class="bar-value">{{ (getCurrentProb(emotion.key) * 100).toFixed(1) }}%</span>
           </div>
         </div>
       </div>
@@ -142,7 +158,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onUnmounted, nextTick } from 'vue'
+import { ref, reactive, onUnmounted, nextTick } from 'vue'
 import { createRealtimeSocket } from '../api.js'
 import {
   REALTIME_EMOTIONS,
@@ -159,8 +175,6 @@ const currentJobId = ref('')
 const videoRef = ref(null)
 const canvasRef = ref(null)
 const timelineRef = ref(null)
-const displaySource = ref('face')
-
 // 当前面部/语音结果
 const faceResult = reactive({
   emotion: 'neutral',
@@ -180,18 +194,6 @@ const voiceResult = reactive({
 const timeline = ref([])
 
 // ===== 计算属性 =====
-const currentResult = computed(() => {
-  return displaySource.value === 'face' ? faceResult : voiceResult
-})
-
-const currentEmotionIcon = computed(() => getEmotionIcon(currentResult.value.emotion))
-const currentEmotionName = computed(() => getEmotionName(currentResult.value.emotion))
-const currentEmotionColor = computed(() => getEmotionColor(currentResult.value.emotion))
-const currentConfidence = computed(() => (currentResult.value.confidence * 100).toFixed(1))
-
-function getCurrentProb(key) {
-  return currentResult.value.probabilities?.[key] || 0
-}
 
 // ===== 媒体流和 WebSocket =====
 let mediaStream = null
@@ -560,43 +562,58 @@ onUnmounted(() => {
 
 /* 结果面板 */
 .result-panel {
-  width: 320px;
-  flex-shrink: 0;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: row;
+  gap: 12px;
+}
+
+.source-section {
+  flex: 1;
+  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: 8px;
+  background: #fff;
+  border-radius: 12px;
+  padding: 12px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+}
+
+.source-header {
+  font-size: 13px;
+  font-weight: 600;
+  color: #333;
 }
 
 .current-emotion {
-  background: #fff;
-  border-radius: 12px;
-  padding: 20px;
   display: flex;
   align-items: center;
-  gap: 16px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
-  border-left: 4px solid #8e8e93;
+  gap: 10px;
+  border-left: 3px solid #8e8e93;
+  padding-left: 10px;
 }
 
 .emotion-icon {
-  font-size: 48px;
+  font-size: 32px;
   line-height: 1;
 }
 
 .emotion-info {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 
 .emotion-label {
-  font-size: 20px;
+  font-size: 15px;
   font-weight: 600;
   color: #333;
 }
 
 .emotion-confidence {
-  font-size: 14px;
+  font-size: 12px;
   color: #8e8e93;
 }
 
@@ -605,83 +622,51 @@ onUnmounted(() => {
   font-weight: 500;
 }
 
-/* 数据源切换 */
-.source-tabs {
-  display: flex;
-  gap: 8px;
-}
-
-.source-tab {
-  flex: 1;
-  padding: 8px 12px;
-  border: 1px solid #ddd;
-  border-radius: 8px;
-  background: #fff;
-  font-size: 13px;
-  cursor: pointer;
-  transition: all 0.15s;
-  text-align: center;
-}
-
-.source-tab:hover {
-  border-color: #007aff;
-}
-
-.source-tab.active {
-  background: #007aff;
-  color: #fff;
-  border-color: #007aff;
-}
-
 /* 概率柱状图 */
 .probability-bars {
-  background: #fff;
-  border-radius: 12px;
-  padding: 16px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 6px;
 }
 
 .bar-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 .bar-icon {
-  font-size: 16px;
-  width: 20px;
+  font-size: 13px;
+  width: 16px;
   text-align: center;
 }
 
 .bar-label {
-  font-size: 12px;
+  font-size: 11px;
   color: #666;
-  width: 32px;
+  width: 28px;
   flex-shrink: 0;
 }
 
 .bar-track {
   flex: 1;
-  height: 12px;
+  height: 8px;
   background: #f0f0f0;
-  border-radius: 6px;
+  border-radius: 4px;
   overflow: hidden;
 }
 
 .bar-fill {
   height: 100%;
-  border-radius: 6px;
+  border-radius: 4px;
   transition: width 0.3s ease;
   min-width: 0;
 }
 
 .bar-value {
-  font-size: 11px;
+  font-size: 10px;
   color: #8e8e93;
-  width: 42px;
+  width: 38px;
   text-align: right;
   flex-shrink: 0;
 }
@@ -807,7 +792,7 @@ onUnmounted(() => {
   }
 
   .result-panel {
-    width: 100%;
+    flex-direction: column;
   }
 }
 </style>
