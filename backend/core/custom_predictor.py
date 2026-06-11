@@ -107,7 +107,7 @@ class CustomEmotionPredictor:
         if model_path is None:
             # 默认使用 emotion_web/backend/models/ 下的模型
             model_path = os.path.join(
-                os.path.dirname(__file__), '..', 'models', 'best_model.pt')
+                os.path.dirname(__file__), '..', 'models', 'full_model_9th_fold.pt')
 
         if not os.path.isfile(model_path):
             raise FileNotFoundError(f"模型文件不存在: {model_path}")
