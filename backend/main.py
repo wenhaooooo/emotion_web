@@ -38,14 +38,32 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"面部表情识别模型加载失败: {e}")
 
-    # 预加载语音情感识别模型
-    logger.info("正在加载语音情感识别模型...")
-    try:
-        from core.recognizer import _get_predictor
-        _get_predictor()
-        logger.info("语音情感识别模型加载完成")
-    except Exception as e:
-        logger.error(f"语音情感识别模型加载失败: {e}")
+    # 预加载自训练情感识别模型（优先），回退到 emotion2vec
+    import os
+    if os.environ.get("EMOTION_MODEL", "custom") == "custom":
+        logger.info("正在加载自训练多模态情感识别模型...")
+        try:
+            from core.custom_predictor import _get_custom_predictor
+            predictor = _get_custom_predictor()
+            predictor._ensure_model()  # 触发实际模型加载
+            logger.info("自训练多模态情感识别模型加载完成")
+        except Exception as e:
+            logger.error(f"自训练模型加载失败: {e}")
+            logger.info("尝试加载 emotion2vec 备用模型...")
+            try:
+                from core.recognizer import _get_predictor
+                _get_predictor()
+                logger.info("emotion2vec 备用模型加载完成")
+            except Exception as e2:
+                logger.error(f"emotion2vec 备用模型加载也失败: {e2}")
+    else:
+        logger.info("正在加载语音情感识别模型 (emotion2vec)...")
+        try:
+            from core.recognizer import _get_predictor
+            _get_predictor()
+            logger.info("语音情感识别模型加载完成")
+        except Exception as e:
+            logger.error(f"语音情感识别模型加载失败: {e}")
 
     yield
 

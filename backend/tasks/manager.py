@@ -96,10 +96,25 @@ class JobManager:
 
 
 def run_processing_job(job_manager: JobManager, job_id: str, video_path: str, video_name: str, jobs_dir: Path):
-    """Background thread: split video → run emotion2vec → save results."""
+    """Background thread: split video → run emotion recognition → save results."""
     from core.segmentation import split_video_by_utterances
-    from core.recognizer import recognize_segment
     from core.ffmpeg_utils import get_video_duration
+    import os
+
+    # 优先使用自训练模型，回退到 emotion2vec
+    use_custom = os.environ.get("EMOTION_MODEL", "custom") == "custom"
+    if use_custom:
+        try:
+            from core.custom_predictor import recognize_segment_custom
+            recognize_fn = recognize_segment_custom
+        except Exception as e:
+            logger.warning(f"自训练模型不可用，回退到 emotion2vec: {e}")
+            from core.recognizer import recognize_segment
+            recognize_fn = recognize_segment
+            use_custom = False
+    else:
+        from core.recognizer import recognize_segment
+        recognize_fn = recognize_segment
 
     job_dir = jobs_dir / job_id
     segments_dir = job_dir / "segments"
@@ -124,13 +139,16 @@ def run_processing_job(job_manager: JobManager, job_id: str, video_path: str, vi
             job_manager.set_failed(job_id, "No segments produced from video")
             return
 
-        # Step 2: Run emotion2vec on each segment
+        # Step 2: Run emotion recognition on each segment
         results = []
         for i, seg in enumerate(segments):
             progress = 0.4 + 0.5 * (i / len(segments))
             job_manager.update_progress(job_id, progress, f"Recognizing emotion {i+1}/{len(segments)}...")
 
-            pred = recognize_segment(seg.output_path)
+            if use_custom:
+                pred = recognize_fn(seg.output_path, text=seg.text)
+            else:
+                pred = recognize_fn(seg.output_path)
 
             seg_result = SegmentResult(
                 index=seg.index,

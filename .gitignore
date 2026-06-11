@@ -32,6 +32,7 @@ logs/
 Thumbs.db
 
 storage/
+backend/models/*.pt
 
 .claude/
 
