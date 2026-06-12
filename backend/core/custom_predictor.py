@@ -65,30 +65,39 @@ class CustomEmotionPredictor:
     4. 三模态特征送入 PromptModel 推理 → 4 类教师情感
     """
 
-    def __init__(self, model_path=None, device='cpu'):
+    def __init__(self, model_path=None, device='auto'):
         """
         初始化预测器。模型和特征提取器均为延迟加载。
 
         参数:
             model_path: best_model.pt 的路径。为 None 时使用默认路径。
-            device: 'cpu' 或 'cuda'
+            device: 'auto', 'cpu', 'cuda', 或 'mps'。'auto' 会自动检测可用设备。
         """
-        self.device = torch.device(device)
+        # 自动检测最佳设备
+        if device == 'auto':
+            if torch.cuda.is_available():
+                self.device = torch.device('cuda')
+                logger.info("使用 CUDA 设备")
+            elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                self.device = torch.device('mps')
+                logger.info("使用 MPS 设备 (Apple Silicon GPU)")
+            else:
+                self.device = torch.device('cpu')
+                logger.info("使用 CPU 设备")
+        else:
+            self.device = torch.device(device)
+        
         self._model = None
         self._hyp_params = None
         self._model_path = model_path
         self._bert_tokenizer = None
         self._bert_model = None
         self._emotion2vec_model = None
-        self._face_mesh_model = None
-        self._haar_cascade = None
+        self._insightface_detector = None
+        self._insightface_landmarker = None
 
-        # BERT 模型路径 — 与主项目 extract_features.py 使用相同模型
-        self._bert_model_path = os.path.join(
-            os.path.dirname(__file__), '..', '..', '..', 'models', 'roberta-chinese')
-        # 如果相对路径不存在，尝试绝对路径
-        if not os.path.isdir(self._bert_model_path):
-            self._bert_model_path = os.path.abspath(self._bert_model_path)
+        # BERT 模型路径 — 使用教师情感数据集的 RoBERTa 模型
+        self._bert_model_path = '/Users/wenhao/code/Python/teacher_emotion_dataset/models/roberta-chinese'
 
     @property
     def is_loaded(self):
@@ -284,177 +293,217 @@ class CustomEmotionPredictor:
     # 视觉特征提取 (MediaPipe Face Mesh, 28-d)
     # ============================================================
 
-    def _ensure_face_mesh(self):
-        """延迟加载 MediaPipe Face Mesh。"""
-        if self._face_mesh_model is not None:
+    def _ensure_insightface(self):
+        """延迟加载 InsightFace 人脸检测器和关键点模型。"""
+        if self._insightface_detector is not None:
             return
 
         try:
-            import mediapipe as mp
-            self._face_mesh_model = mp.solutions.face_mesh.FaceMesh(
-                static_image_mode=True, max_num_faces=1, refine_landmarks=True,
-                min_detection_confidence=0.3, min_tracking_confidence=0.3)
-            logger.info("MediaPipe Face Mesh 加载完成")
+            import insightface
+            from insightface.app import FaceAnalysis
+            import onnxruntime as ort
+
+            # 配置加速提供器（优先使用 MPS/CoreML）
+            providers = []
+            
+            # 尝试添加 CoreML 提供器（Apple Silicon GPU 加速）
+            if 'CoreMLExecutionProvider' in ort.get_available_providers():
+                providers.append('CoreMLExecutionProvider')
+                logger.info("检测到 CoreML 支持，将用于 GPU 加速")
+            
+            # 回退到 CPU
+            providers.append('CPUExecutionProvider')
+
+            # 使用 InsightFace 的默认模型
+            self._insightface_detector = FaceAnalysis(
+                name='buffalo_l',
+                providers=providers
+            )
+            self._insightface_detector.prepare(ctx_id=0, det_size=(640, 640))
+            logger.info(f"InsightFace 加载完成，使用提供器: {providers}")
         except Exception as e:
-            logger.warning(f"MediaPipe 加载失败: {e}，视觉特征将使用零向量")
-            self._face_mesh_model = "not_available"
-
-    def _ensure_haar_cascade(self):
-        """加载 Haar 级联分类器。"""
-        if self._haar_cascade is not None:
-            return
-        try:
-            import cv2
-            default_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            if os.path.isfile(default_path):
-                self._haar_cascade = cv2.CascadeClassifier(default_path)
-            else:
-                self._haar_cascade = "not_available"
-        except Exception:
-            self._haar_cascade = "not_available"
+            logger.warning(f"InsightFace 加载失败: {e}，视觉特征将使用零向量")
+            self._insightface_detector = "not_available"
 
     def _detect_face_region(self, frame):
-        """Haar 级联人脸检测并裁剪。"""
-        import cv2
-        self._ensure_haar_cascade()
-        if self._haar_cascade == "not_available":
+        """使用 InsightFace 进行人脸检测并裁剪。"""
+        self._ensure_insightface()
+        if self._insightface_detector == "not_available":
             return frame
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = self._haar_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-
-        if len(faces) > 0:
-            x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])
-            margin_x, margin_y = int(fw * 0.3), int(fh * 0.3)
-            x1, y1 = max(0, x - margin_x), max(0, y - margin_y)
-            x2 = min(frame.shape[1], x + fw + margin_x)
-            y2 = min(frame.shape[0], y + fh + margin_y)
-            return frame[y1:y2, x1:x2]
+        try:
+            faces = self._insightface_detector.get(frame)
+            if len(faces) > 0:
+                # 选择置信度最高的人脸
+                face = max(faces, key=lambda f: f.det_score)
+                bbox = face.bbox.astype(int)
+                x1, y1, x2, y2 = bbox
+                # 添加边界余量
+                margin = int((x2 - x1) * 0.2)
+                h, w = frame.shape[:2]
+                x1 = max(0, x1 - margin)
+                y1 = max(0, y1 - margin)
+                x2 = min(w, x2 + margin)
+                y2 = min(h, y2 + margin)
+                return frame[y1:y2, x1:x2]
+        except Exception as e:
+            logger.warning(f"InsightFace 人脸检测失败: {e}")
+        
         return frame
 
     @staticmethod
-    def _compute_au_from_landmarks(landmarks, w, h):
-        """从 MediaPipe 关键点推算 AU-like 特征 (9-d)。"""
-        lm = np.array([[p.x * w, p.y * h, p.z] for p in landmarks])
-
-        def dist(a, b):
-            return np.linalg.norm(lm[a] - lm[b])
-
-        face_height = dist(10, 152)
-        if face_height < 1e-6:
-            face_height = 1.0
-
-        aus = []
-        # AU4 - 皱眉
-        brow_inner_dist = (dist(66, 133) + dist(296, 362)) / 2.0
-        eye_inner_dist = (dist(133, 33) + dist(362, 263)) / 2.0
-        aus.append((brow_inner_dist / (eye_inner_dist + 1e-6) - 1.0) * 10.0)
-        # AU6 - 脸颊收紧
-        cheek_tight = (dist(61, 33) + dist(291, 263)) / 2.0
-        aus.append(cheek_tight / face_height * 5.0)
-        # AU9 - 鼻皱
-        nose_width = dist(48, 278)
-        nose_bridge = dist(6, 168)
-        aus.append(nose_width / (nose_bridge + 1e-6) * 5.0)
-        # AU12 - 嘴角上扬
-        mouth_center_y = (lm[13][1] + lm[14][1]) / 2.0
-        mouth_corner_y = (lm[61][1] + lm[291][1]) / 2.0
-        mouth_width = dist(61, 291)
-        smile = (mouth_center_y - mouth_corner_y) / (mouth_width + 1e-6) * 10.0
-        aus.append(smile)
-        # AU15 - 嘴角下拉
-        aus.append(max(0, -smile))
-        # AU17 - 下巴抬起
-        chin_raise = dist(17, 152) / face_height * 10.0
-        aus.append(chin_raise)
-        # AU24 - 嘴唇收紧
-        lip_upper = dist(13, 0)
-        lip_lower = dist(14, 17)
-        lip_tight = (lip_upper + lip_lower) / (face_height + 1e-6) * 5.0
-        aus.append(lip_tight)
-        # AU25 - 嘴唇张开
-        lip_open = dist(13, 14) / face_height * 10.0
-        aus.append(lip_open)
-        # AU45 - 眨眼
-        left_eye_open = dist(159, 145)
-        right_eye_open = dist(386, 374)
-        eye_open = (left_eye_open + right_eye_open) / 2.0
-        eye_width = (dist(33, 133) + dist(263, 362)) / 2.0
-        aus.append(eye_open / (eye_width + 1e-6) * 5.0)
-
-        return np.array(aus, dtype=np.float32)
-
-    @staticmethod
-    def _compute_face_geometry(landmarks, w, h):
-        """从 MediaPipe 关键点头部姿态/眼睛/嘴巴几何特征 (19-d)。"""
-        lm = np.array([[p.x * w, p.y * h, p.z] for p in landmarks])
-
-        def dist(a, b):
-            return np.linalg.norm(lm[a] - lm[b])
-
-        face_height = dist(10, 152)
-        if face_height < 1e-6:
-            face_height = 1.0
-
-        feats = []
-        # Head Pose (3-d)
-        nose_tip = lm[1]
-        left_face, right_face = lm[234], lm[454]
-        face_center_x = (left_face[0] + right_face[0]) / 2.0
-        face_width = abs(right_face[0] - left_face[0]) + 1e-6
-        feats.append((nose_tip[0] - face_center_x) / face_width * 2.0)
-        forehead, chin = lm[10], lm[152]
-        feats.append((nose_tip[1] - forehead[1]) / (chin[1] - forehead[1] + 1e-6) * 2.0 - 1.0)
-        left_eye_center = (lm[33] + lm[133]) / 2.0
-        right_eye_center = (lm[263] + lm[362]) / 2.0
-        feats.append(np.arctan2(right_eye_center[1] - left_eye_center[1],
-                                right_eye_center[0] - left_eye_center[0]))
-        # Gaze (2-d)
-        left_iris = lm[468] if len(lm) > 468 else lm[0]
-        left_eye_width = dist(133, 33) + 1e-6
-        feats.append((left_iris[0] - lm[133][0]) / left_eye_width * 2.0 - 1.0)
-        right_iris = lm[473] if len(lm) > 473 else lm[0]
-        right_eye_width = dist(362, 263) + 1e-6
-        feats.append((right_iris[0] - lm[362][0]) / right_eye_width * 2.0 - 1.0)
-        # Eye (4-d)
-        feats.append(dist(159, 145) / face_height * 10.0)
-        feats.append(dist(386, 374) / face_height * 10.0)
-        feats.append(dist(33, 133) / face_height * 10.0)
-        feats.append(dist(263, 362) / face_height * 10.0)
-        # Eyebrow (4-d)
-        feats.append(dist(70, 159) / face_height * 10.0)
-        feats.append(dist(300, 386) / face_height * 10.0)
-        feats.append(dist(107, 70) / face_height * 10.0)
-        feats.append(dist(336, 300) / face_height * 10.0)
-        # Mouth (6-d)
-        feats.append(dist(13, 14) / face_height * 10.0)
-        feats.append(dist(61, 291) / face_height * 10.0)
-        feats.append(dist(0, 13) / face_height * 10.0)
-        feats.append(dist(17, 14) / face_height * 10.0)
-        mouth_center_y = (lm[13][1] + lm[14][1]) / 2.0
-        mouth_corner_y = (lm[61][1] + lm[291][1]) / 2.0
-        feats.append((mouth_center_y - mouth_corner_y) / face_height * 10.0)
-        feats.append(dist(78, 308) / face_height * 10.0)
-
-        return np.array(feats, dtype=np.float32)
-
-    def _extract_visual_features(self, video_path, max_frames=50):
+    def _compute_features_from_insightface(face, w, h):
         """
-        从视频提取 MediaPipe 视觉特征 (28-d)。
+        从 InsightFace 人脸特征计算视觉特征 (28-d)。
+        
+        InsightFace 的 landmark_2d_106 关键点索引:
+        - 0-16: 下巴轮廓
+        - 17-26: 左眉
+        - 27-35: 鼻子
+        - 36-45: 左眼
+        - 46-55: 右眼
+        - 56-67: 嘴巴外部
+        - 68-82: 嘴巴内部
+        - 83-95: 左眼轮廓
+        - 96-105: 右眼轮廓
+        """
+        # 使用 106 个关键点
+        lm = face.landmark_2d_106 if hasattr(face, 'landmark_2d_106') else face.kps
+        
+        if lm is None:
+            # 如果没有关键点，使用 5 点关键点
+            if hasattr(face, 'kps') and face.kps is not None:
+                lm = face.kps
+            else:
+                return np.zeros(28, dtype=np.float32)
+        
+        lm = np.array(lm)
+        if lm.ndim == 1:
+            lm = lm.reshape(-1, 2)
+        
+        def dist(a, b):
+            return np.linalg.norm(lm[a] - lm[b])
+        
+        # 计算人脸高度（从额头到下巴）
+        if len(lm) >= 106:
+            face_height = dist(10, 15)  # 额头顶部到下巴底部
+        elif len(lm) >= 5:
+            face_height = np.linalg.norm(lm[0] - lm[4]) * 2  # 眼睛到嘴巴的距离作为参考
+        else:
+            face_height = 1.0
+        
+        if face_height < 1e-6:
+            face_height = 1.0
+        
+        feats = []
+        
+        # 面部几何特征 (19-d)
+        # Head Pose (3-d)
+        if len(lm) >= 106:
+            nose_tip = lm[30]
+            left_face, right_face = lm[2], lm[14]
+            face_center_x = (left_face[0] + right_face[0]) / 2.0
+            face_width = abs(right_face[0] - left_face[0]) + 1e-6
+            feats.append((nose_tip[0] - face_center_x) / face_width * 2.0)
+            
+            forehead = lm[10]
+            chin = lm[15]
+            feats.append((nose_tip[1] - forehead[1]) / (chin[1] - forehead[1] + 1e-6) * 2.0 - 1.0)
+            
+            left_eye_center = (lm[36] + lm[45]) / 2.0
+            right_eye_center = (lm[46] + lm[55]) / 2.0
+            feats.append(np.arctan2(right_eye_center[1] - left_eye_center[1],
+                                    right_eye_center[0] - left_eye_center[0]))
+        else:
+            feats.extend([0.0, 0.0, 0.0])
+        
+        # Eye (4-d) - 眼睛宽度和高度
+        if len(lm) >= 106:
+            feats.append(dist(37, 41) / face_height * 10.0)  # 左眼高度
+            feats.append(dist(48, 52) / face_height * 10.0)  # 右眼高度
+            feats.append(dist(36, 39) / face_height * 10.0)  # 左眼宽度
+            feats.append(dist(46, 49) / face_height * 10.0)  # 右眼宽度
+        elif len(lm) >= 5:
+            feats.extend([0.0, 0.0, 0.0, 0.0])
+        else:
+            feats.extend([0.0, 0.0, 0.0, 0.0])
+        
+        # Eyebrow (4-d)
+        if len(lm) >= 106:
+            feats.append(dist(17, 21) / face_height * 10.0)  # 左眉长度
+            feats.append(dist(22, 26) / face_height * 10.0)  # 右眉长度
+            feats.append(dist(19, 37) / face_height * 10.0)  # 左眉到左眼距离
+            feats.append(dist(24, 46) / face_height * 10.0)  # 右眉到右眼距离
+        else:
+            feats.extend([0.0, 0.0, 0.0, 0.0])
+        
+        # Mouth (6-d)
+        if len(lm) >= 106:
+            feats.append(dist(61, 67) / face_height * 10.0)  # 嘴巴宽度
+            feats.append(dist(57, 82) / face_height * 10.0)  # 嘴巴高度
+            feats.append(dist(57, 61) / face_height * 10.0)  # 左嘴角到上唇
+            feats.append(dist(57, 67) / face_height * 10.0)  # 右嘴角到上唇
+            mouth_center_y = (lm[57][1] + lm[82][1]) / 2.0
+            mouth_corner_y = (lm[61][1] + lm[67][1]) / 2.0
+            feats.append((mouth_center_y - mouth_corner_y) / face_height * 10.0)  # 微笑程度
+            feats.append(dist(57, 82) / (dist(61, 67) + 1e-6))  # 嘴巴宽高比
+        elif len(lm) >= 5:
+            feats.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        else:
+            feats.extend([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        
+        # Gaze (2-d) - 简化版
+        feats.extend([0.0, 0.0])
+        
+        # AU-like 特征 (9-d)
+        aus = []
+        if len(lm) >= 106:
+            # AU4 - 皱眉
+            brow_inner_dist = dist(21, 22)
+            eye_inner_dist = dist(39, 42)
+            aus.append((brow_inner_dist / (eye_inner_dist + 1e-6) - 1.0) * 10.0)
+            # AU12 - 嘴角上扬
+            mouth_center_y = (lm[57][1] + lm[82][1]) / 2.0
+            mouth_corner_y = (lm[61][1] + lm[67][1]) / 2.0
+            mouth_width = dist(61, 67)
+            smile = (mouth_center_y - mouth_corner_y) / (mouth_width + 1e-6) * 10.0
+            aus.append(smile)
+            # AU15 - 嘴角下拉
+            aus.append(max(0, -smile))
+            # AU25 - 嘴唇张开
+            lip_open = dist(57, 82) / face_height * 10.0
+            aus.append(lip_open)
+            # 眼睛睁开程度
+            eye_open = (dist(37, 41) + dist(48, 52)) / 2.0 / face_height * 10.0
+            aus.append(eye_open)
+        else:
+            aus.extend([0.0, 0.0, 0.0, 0.0, 0.0])
+        
+        # 补充剩余的 AU 特征
+        aus.extend([0.0] * (9 - len(aus)))
+        
+        feats.extend(aus)
+        
+        return np.array(feats[:28], dtype=np.float32)
+
+    def _extract_visual_features(self, video_path, max_frames=15):
+        """
+        从视频提取 InsightFace 视觉特征 (28-d)。
 
         对 max_frames 帧均匀采样，提取面部关键点特征后取平均。
+        减少采样帧数可显著提升处理速度，15帧已足够捕捉面部表情变化。
 
         参数:
             video_path: 视频文件路径
-            max_frames: 最大采样帧数
+            max_frames: 最大采样帧数（默认15帧，平衡速度与准确性）
 
         返回:
             np.ndarray, shape (28,), dtype float32
         """
         import cv2
-        self._ensure_face_mesh()
+        self._ensure_insightface()
 
-        if self._face_mesh_model == "not_available":
+        if self._insightface_detector == "not_available":
             return np.zeros(28, dtype=np.float32)
 
         cap = cv2.VideoCapture(video_path)
@@ -475,17 +524,13 @@ class CustomEmotionPredictor:
                 if not ret or frame is None:
                     continue
 
-                face_crop = self._detect_face_region(frame)
-                crop_h, crop_w = face_crop.shape[:2]
-
-                rgb_frame = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
-                results = self._face_mesh_model.process(rgb_frame)
-
-                if results.multi_face_landmarks and len(results.multi_face_landmarks) > 0:
-                    landmarks = results.multi_face_landmarks[0].landmark
-                    au_feats = self._compute_au_from_landmarks(landmarks, crop_w, crop_h)
-                    geo_feats = self._compute_face_geometry(landmarks, crop_w, crop_h)
-                    frame_feat = np.concatenate([geo_feats, au_feats]).astype(np.float32)
+                # 使用 InsightFace 检测人脸并提取特征
+                faces = self._insightface_detector.get(frame)
+                if len(faces) > 0:
+                    # 选择置信度最高的人脸
+                    face = max(faces, key=lambda f: f.det_score)
+                    h, w = frame.shape[:2]
+                    frame_feat = self._compute_features_from_insightface(face, w, h)
                 else:
                     frame_feat = np.zeros(28, dtype=np.float32)
 
