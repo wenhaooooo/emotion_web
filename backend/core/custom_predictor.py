@@ -44,7 +44,7 @@ EMOTION2VEC_LABELS = {
 _custom_cache = {}
 
 
-def _get_custom_predictor(model_path=None, device='cpu'):
+def _get_custom_predictor(model_path=None, device='auto'):
     """获取或创建 CustomEmotionPredictor 单例。"""
     cache_key = (model_path, device)
     if cache_key in _custom_cache:

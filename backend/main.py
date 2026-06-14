@@ -11,6 +11,13 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # 使用 HuggingFace 国内镜像
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
+# 配置日志：确保所有模块的 INFO 日志都能输出到终端
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s",
+    force=True,
+)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
